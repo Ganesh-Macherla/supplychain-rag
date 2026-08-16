@@ -12,7 +12,7 @@ It retrieves relevant information from the source documents and generates answer
 
 [![Watch the Demo](https://img.youtube.com/vi/_Mz2-YFcmbE/maxresdefault.jpg)]([https://youtu.be/_Mz2-YFcmbE](https://www.youtube.com/watch?v=_Mz2-YFcmbE))
 
-▶️ [Watch the full demo on YouTube]([https://youtu.be/_Mz2-YFcmbE](https://www.youtube.com/watch?v=_Mz2-YFcmbE))
+▶️ [Watch the full demo on YouTube](https://youtu.be/_Mz2-YFcmbE)
 
 ## Key Features
 
