@@ -8,6 +8,12 @@ The system allows users to ask questions about supplier performance, procurement
 
 It retrieves relevant information from the source documents and generates answers grounded only in the retrieved context. Policy conditions are also evaluated deterministically to reduce incorrect clause application.
 
+## 🎥 Demo
+
+[![Watch the Demo](https://img.youtube.com/vi/_Mz2-YFcmbE/maxresdefault.jpg)]([https://youtu.be/_Mz2-YFcmbE](https://www.youtube.com/watch?v=_Mz2-YFcmbE))
+
+▶️ [Watch the full demo on YouTube]([https://youtu.be/_Mz2-YFcmbE](https://www.youtube.com/watch?v=_Mz2-YFcmbE))
+
 ## Key Features
 
 - PDF-based document processing
