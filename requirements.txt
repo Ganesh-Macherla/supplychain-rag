@@ -1,0 +1,5 @@
+chromadb
+requests
+pypdf
+python-dotenv
+streamlit

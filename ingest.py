@@ -1,179 +1,366 @@
-from pathlib import Path
+import os
+import sys
+from typing import Dict, List
 
-import chromadb
-import ollama
+from dotenv import load_dotenv
 from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import chromadb
+import requests
 
 
-# -----------------------------
+# --------------------------------------------------
 # Configuration
-# -----------------------------
+# --------------------------------------------------
 
-DATA_DIR = Path("data")
-CHROMA_DIR = Path("chroma_db")
+load_dotenv()
+
+CHROMA_DIR = os.getenv(
+    "CHROMA_DIR",
+    "chroma_db"
+)
 
 COLLECTION_NAME = "meridian_supply_chain"
 
-EMBED_MODEL = "nomic-embed-text"
+EMBEDDING_MODEL = "nomic-embed-text"
+
+OLLAMA_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
 
-# -----------------------------
-# Load PDFs
-# -----------------------------
+# --------------------------------------------------
+# ChromaDB
+# --------------------------------------------------
 
-def load_pdfs():
-    documents = []
+def get_collection():
 
-    pdf_files = list(DATA_DIR.glob("*.pdf"))
+    client = chromadb.PersistentClient(
+        path=CHROMA_DIR
+    )
 
-    if not pdf_files:
-        raise FileNotFoundError("No PDF files found in the data/ folder.")
+    return client.get_or_create_collection(
+        name=COLLECTION_NAME
+    )
 
-    for pdf_path in pdf_files:
-        reader = PdfReader(pdf_path)
 
-        print(f"\nReading: {pdf_path.name}")
-        print(f"Pages: {len(reader.pages)}")
+# --------------------------------------------------
+# Ollama Embeddings
+# --------------------------------------------------
 
-        for page_number, page in enumerate(reader.pages, start=1):
-            text = page.extract_text()
+def embed_texts(texts: List[str]) -> List[List[float]]:
 
-            if not text or not text.strip():
-                continue
+    embeddings = []
 
-            documents.append({
-                "text": text.strip(),
-                "source": pdf_path.name,
-                "page": page_number
+    for index, text in enumerate(texts, start=1):
+
+        print(
+            f"Embedding chunk {index}/{len(texts)}..."
+        )
+
+        response = requests.post(
+            f"{OLLAMA_URL}/api/embeddings",
+            json={
+                "model": EMBEDDING_MODEL,
+                "prompt": text,
+            },
+            timeout=120,
+        )
+
+        response.raise_for_status()
+
+        embeddings.append(
+            response.json()["embedding"]
+        )
+
+    return embeddings
+
+
+# --------------------------------------------------
+# Extract PDF pages
+# --------------------------------------------------
+
+def extract_pages(pdf_path: str) -> List[Dict]:
+
+    reader = PdfReader(pdf_path)
+
+    pages = []
+
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
+
+        text = page.extract_text() or ""
+
+        text = text.strip()
+
+        if text:
+
+            pages.append({
+                "page": page_number,
+                "text": text
             })
 
-    return documents
+    return pages
 
 
-# -----------------------------
-# Chunk documents
-# -----------------------------
+# --------------------------------------------------
+# Recursive-style chunking
+# --------------------------------------------------
 
-def create_chunks(documents):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP
+def recursive_split(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> List[str]:
+
+    separators = [
+        "\n\n",
+        "\n",
+        ". ",
+        " "
+    ]
+
+    def split_text(
+        current_text: str,
+        separators_left: List[str]
+    ):
+
+        if len(current_text) <= chunk_size:
+
+            return [
+                current_text
+            ] if current_text.strip() else []
+
+        if not separators_left:
+
+            return [
+                current_text[i:i + chunk_size]
+                for i in range(
+                    0,
+                    len(current_text),
+                    chunk_size
+                )
+            ]
+
+        separator = separators_left[0]
+
+        parts = current_text.split(
+            separator
+        )
+
+        chunks = []
+
+        current = ""
+
+        for part in parts:
+
+            candidate = (
+                current
+                + (
+                    separator
+                    if current
+                    else ""
+                )
+                + part
+            )
+
+            if len(candidate) <= chunk_size:
+
+                current = candidate
+
+            else:
+
+                if current:
+
+                    chunks.append(current)
+
+                if len(part) > chunk_size:
+
+                    chunks.extend(
+                        split_text(
+                            part,
+                            separators_left[1:]
+                        )
+                    )
+
+                    current = ""
+
+                else:
+
+                    current = part
+
+        if current:
+
+            chunks.append(current)
+
+        return chunks
+
+    raw_chunks = split_text(
+        text,
+        separators
     )
 
     chunks = []
 
-    for document in documents:
-        split_texts = splitter.split_text(document["text"])
+    for index, chunk in enumerate(
+        raw_chunks
+    ):
 
-        for chunk_number, chunk_text in enumerate(split_texts):
-            chunks.append({
-                "text": chunk_text,
-                "source": document["source"],
-                "page": document["page"],
-                "chunk": chunk_number
-            })
+        if index == 0 or overlap == 0:
 
-    return chunks
+            chunks.append(chunk)
+
+        else:
+
+            previous_tail = raw_chunks[
+                index - 1
+            ][-overlap:]
+
+            chunks.append(
+                previous_tail + chunk
+            )
+
+    return [
+        chunk.strip()
+        for chunk in chunks
+        if chunk.strip()
+    ]
 
 
-# -----------------------------
-# Create embeddings
-# -----------------------------
+# --------------------------------------------------
+# Ingest PDFs
+# --------------------------------------------------
 
-def create_embeddings(chunks):
-    all_embeddings = []
+def ingest_files(
+    pdf_paths: List[str]
+) -> Dict:
 
-    batch_size = 32
+    collection = get_collection()
 
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
+    all_chunks = []
+    all_metadatas = []
+    all_ids = []
+
+    for pdf_path in pdf_paths:
+
+        filename = os.path.basename(
+            pdf_path
+        )
 
         print(
-            f"Embedding chunks {i + 1}–"
-            f"{min(i + batch_size, len(chunks))} "
-            f"of {len(chunks)}..."
+            f"\nProcessing: {filename}"
         )
 
-        response = ollama.embed(
-            model=EMBED_MODEL,
-            input=[chunk["text"] for chunk in batch]
+        pages = extract_pages(
+            pdf_path
         )
 
-        all_embeddings.extend(response["embeddings"])
+        print(
+            f"Pages extracted: {len(pages)}"
+        )
 
-    return all_embeddings
+        for page_info in pages:
 
+            page_chunks = recursive_split(
+                page_info["text"]
+            )
 
-# -----------------------------
-# Store in ChromaDB
-# -----------------------------
+            for chunk_number, chunk_text in enumerate(
+                page_chunks
+            ):
 
-def store_in_chroma(chunks, embeddings):
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR)
+                chunk_id = (
+                    f"{filename}"
+                    f"::p{page_info['page']}"
+                    f"::c{chunk_number}"
+                )
+
+                all_chunks.append(
+                    chunk_text
+                )
+
+                all_metadatas.append({
+                    "source": filename,
+                    "page": page_info["page"]
+                })
+
+                all_ids.append(
+                    chunk_id
+                )
+
+    if not all_chunks:
+
+        return {
+            "files": len(pdf_paths),
+            "chunks": 0
+        }
+
+    print(
+        f"\nTotal chunks: {len(all_chunks)}"
     )
 
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME
+    print(
+        "\nGenerating embeddings..."
     )
 
-    ids = []
+    embeddings = embed_texts(
+        all_chunks
+    )
 
-    for index, chunk in enumerate(chunks):
-        ids.append(
-            f"{chunk['source']}_page_{chunk['page']}_chunk_{chunk['chunk']}_{index}"
-        )
+    print(
+        "\nStoring embeddings in ChromaDB..."
+    )
 
     collection.upsert(
-        ids=ids,
-        documents=[chunk["text"] for chunk in chunks],
+        ids=all_ids,
         embeddings=embeddings,
-        metadatas=[
-            {
-                "source": chunk["source"],
-                "page": chunk["page"],
-                "chunk": chunk["chunk"]
-            }
-            for chunk in chunks
-        ]
+        documents=all_chunks,
+        metadatas=all_metadatas
     )
 
-    print("\nChromaDB updated successfully.")
-    print(f"Collection: {COLLECTION_NAME}")
-    print(f"Total chunks stored: {collection.count()}")
+    return {
+        "files": len(pdf_paths),
+        "chunks": len(all_chunks)
+    }
 
 
-# -----------------------------
-# Main
-# -----------------------------
+# --------------------------------------------------
+# Collection statistics
+# --------------------------------------------------
 
-def main():
-    print("=== Meridian Supply Chain RAG Ingestion ===")
+def collection_stats() -> Dict:
 
-    documents = load_pdfs()
+    collection = get_collection()
 
-    print(f"\nPages loaded: {len(documents)}")
+    return {
+        "collection_name": COLLECTION_NAME,
+        "total_chunks": collection.count(),
+        "embedding_model": EMBEDDING_MODEL
+    }
 
-    chunks = create_chunks(documents)
 
-    print(f"Chunks created: {len(chunks)}")
-    print(
-        f"Chunk size: {CHUNK_SIZE} characters | "
-        f"Overlap: {CHUNK_OVERLAP} characters"
-    )
-
-    embeddings = create_embeddings(chunks)
-
-    print(f"Embeddings created: {len(embeddings)}")
-
-    store_in_chroma(chunks, embeddings)
-
-    print("\n=== INGESTION COMPLETE ===")
-
+# --------------------------------------------------
+# Standalone execution
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+
+    paths = sys.argv[1:]
+
+    if not paths:
+
+        paths = [
+            "data/Meridian_Supply_Chain_Review_Q1_FY2025-26.pdf",
+            "data/Meridian_Procurement_Policy_Handbook_v4.2.pdf"
+        ]
+
+    result = ingest_files(
+        paths
+    )
+
+    print(
+        f"\n{result['files']} files processed, "
+        f"{result['chunks']} chunks stored."
+    )
