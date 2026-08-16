@@ -30,7 +30,7 @@ COLLECTION_NAME = "meridian_supply_chain"
 EMBEDDING_MODEL = "nomic-embed-text"
 LLM_MODEL = "llama3.2"
 
-TOP_K = 6
+TOP_K = 8
 
 OLLAMA_URL = "http://localhost:11434"
 
@@ -105,8 +105,7 @@ def generate_with_ollama(system_prompt, user_prompt):
 # RETRIEVAL
 # ============================================================
 
-def retrieve_context(question):
-
+def retrieve_context(question, expand_pages=True):
     client = chromadb.PersistentClient(
         path=CHROMA_DIR
     )
@@ -138,7 +137,6 @@ def retrieve_context(question):
         metadatas,
         distances,
     ):
-
         retrieved.append(
             {
                 "text": document,
@@ -148,7 +146,84 @@ def retrieve_context(question):
             }
         )
 
-    return retrieved
+    if not expand_pages:
+        return retrieved
+
+    # --------------------------------------------------------
+    # PAGE EXPANSION
+    #
+    # Semantic search finds the relevant page.
+    # Then retrieve every chunk from that page so that
+    # section/list questions receive the complete section.
+    # --------------------------------------------------------
+
+    page_keys = []
+
+    for item in retrieved:
+
+        key = (
+            item["source"],
+            item["page"],
+        )
+
+        if key not in page_keys:
+            page_keys.append(key)
+
+    expanded = []
+
+    seen = set()
+
+    for source, page in page_keys:
+
+        page_results = collection.get(
+            where={
+                "$and": [
+                    {"source": source},
+                    {"page": page},
+                ]
+            },
+            include=[
+                "documents",
+                "metadatas",
+            ],
+        )
+
+        page_documents = page_results.get(
+            "documents",
+            [],
+        )
+
+        page_metadatas = page_results.get(
+            "metadatas",
+            [],
+        )
+
+        for document, metadata in zip(
+            page_documents,
+            page_metadatas,
+        ):
+
+            key = (
+                metadata["source"],
+                metadata["page"],
+                document,
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            expanded.append(
+                {
+                    "text": document,
+                    "source": metadata["source"],
+                    "page": metadata["page"],
+                    "distance": 0.0,
+                }
+            )
+
+    return expanded
 
 
 # ============================================================
@@ -175,6 +250,84 @@ Page: {item['page']}
         )
 
     return "\n".join(parts)
+
+# ============================================================
+# SECTION-AWARE GENERAL CONTEXT
+# ============================================================
+
+def select_general_context(question, retrieved):
+    """
+    Keep general-answer retrieval focused on the relevant
+    document section instead of sending unrelated chunks
+    to the LLM.
+
+    If a retrieved chunk contains a section heading that
+    matches the question, include the other retrieved chunks
+    from that same document page.
+    """
+
+    question_lower = re.sub(
+        r"\s+",
+        " ",
+        question.lower()
+    ).strip()
+
+    # Important section phrases that may appear in questions.
+    section_phrases = [
+        "risks carried into q2",
+        "actions committed for q2",
+        "supplier performance scorecard",
+        "line-stoppage events",
+        "demand and planning accuracy",
+        "inventory and safety stock policy",
+        "sourcing rules",
+        "performance failures and consequences",
+        "escalation matrix",
+    ]
+
+    # Find the most relevant explicit section phrase.
+    matched_phrase = None
+
+    for phrase in section_phrases:
+        if phrase in question_lower:
+            matched_phrase = phrase
+            break
+
+    # If the question clearly refers to a named section,
+    # keep chunks from that section's document page.
+    if matched_phrase:
+
+        anchor_items = []
+
+        for item in retrieved:
+
+            text_lower = re.sub(
+                r"\s+",
+                " ",
+                item["text"].lower()
+            )
+
+            if matched_phrase in text_lower:
+                anchor_items.append(item)
+
+        if anchor_items:
+
+            anchor = anchor_items[0]
+
+            same_page = [
+                item
+                for item in retrieved
+                if (
+                    item["source"] == anchor["source"]
+                    and item["page"] == anchor["page"]
+                )
+            ]
+
+            if same_page:
+                return same_page
+
+    # Otherwise use normal semantic retrieval.
+    return retrieved[:6]
 
 
 # ============================================================
@@ -243,11 +396,7 @@ def extract_question_metrics(question):
 # EXTRACT SUPPLIER SCORECARD METRICS
 # ============================================================
 
-def extract_scorecard_metrics(
-    supplier,
-    retrieved,
-):
-
+def extract_scorecard_metrics(supplier, retrieved):
     result = {
         "on_time": None,
         "defect_ppm": None,
@@ -256,45 +405,52 @@ def extract_scorecard_metrics(
     if not supplier:
         return result
 
-    supplier_lower = supplier.lower()
+    # Normalize whitespace so PDF line breaks do not prevent
+    # matching supplier names such as "Shenzhen Rui Electronics".
+    normalized_supplier = re.sub(r"\s+", " ", supplier.lower()).strip()
 
     for item in retrieved:
-
         text = item["text"]
 
-        if supplier_lower not in text.lower():
+        # Normalize PDF whitespace while preserving the actual content.
+        normalized_text = re.sub(r"\s+", " ", text).strip()
+        normalized_lower = normalized_text.lower()
+
+        if normalized_supplier not in normalized_lower:
             continue
 
-        # ----------------------------------------------------
-        # Kaveri scorecard row
+        # Scorecard rows follow this structure:
         #
-        # Kaveri Metals Pvt Ltd
-        # Stamped contacts
-        # Coimbatore, India
-        # 88.1% 1,150 22 8.7
-        # ----------------------------------------------------
+        # Supplier | Category | Location | On-time | Defect PPM |
+        # Avg lead time | Q1 spend
+        #
+        # Example:
+        # Shenzhen Rui Electronics Microcontrollers Shenzhen, China
+        # 79.5% 210 46 21.9
+        #
+        # Once the supplier is found, search forward for the first
+        # percentage followed by three numeric scorecard values.
 
-        if supplier_lower == "kaveri metals":
+        supplier_pos = normalized_lower.find(normalized_supplier)
 
-            match = re.search(
-                r"Kaveri\s+Metals.*?"
-                r"(\d+(?:\.\d+)?)%\s+"
-                r"([\d,]+)",
-                text,
-                flags=re.IGNORECASE | re.DOTALL,
+        nearby = normalized_text[supplier_pos:supplier_pos + 500]
+
+        pattern = re.compile(
+            r"(\d+(?:\.\d+)?)%\s+"
+            r"([\d,]+)\s+"
+            r"\d+\s+"
+            r"[\d.]+",
+            flags=re.IGNORECASE,
+        )
+
+        match = pattern.search(nearby)
+
+        if match:
+            result["on_time"] = float(match.group(1))
+            result["defect_ppm"] = float(
+                match.group(2).replace(",", "")
             )
-
-            if match:
-
-                result["on_time"] = float(
-                    match.group(1)
-                )
-
-                result["defect_ppm"] = float(
-                    match.group(2).replace(",", "")
-                )
-
-                return result
+            return result
 
     return result
 
@@ -303,38 +459,16 @@ def extract_scorecard_metrics(
 # CLAUSE 6.2 — STRICT SUPPLIER-SPECIFIC CHECK
 # ============================================================
 
-def check_clause_62(
-    supplier,
-    retrieved,
-):
-
+def check_clause_62(supplier, retrieved):
     """
     Clause 6.2:
+    On-time delivery below 85% for two consecutive quarters.
 
-    On-time delivery below 85% for TWO CONSECUTIVE QUARTERS.
-
-    CRITICAL:
-
-    We do NOT search for the supplier and the word
-    "consecutive" anywhere in the same chunk.
-
-    The evidence must explicitly associate the consecutive-quarter
-    statement with THIS supplier.
-
-    Example from the Meridian document:
-
-    Shenzhen Rui Electronics ...
-    This is the second consecutive quarter in which its
-    on-time delivery has fallen below 85%;
-    Q4 FY 2024-25 closed at 83.2%.
-
-    This is evidence for SHENZHEN RUI.
-
-    It is NOT evidence for Kaveri Metals.
+    Evidence must explicitly associate the consecutive-quarter
+    statement with the requested supplier.
     """
 
     if not supplier:
-
         return {
             "triggered": False,
             "status": "UNKNOWN",
@@ -343,48 +477,33 @@ def check_clause_62(
 
     supplier_lower = supplier.lower()
 
-    # --------------------------------------------------------
-    # We deliberately look at sentences/paragraphs.
-    # --------------------------------------------------------
-
     for item in retrieved:
-
         text = item["text"]
 
         if supplier_lower not in text.lower():
             continue
 
-        # Split into sentences.
-        sentences = re.split(
-            r"(?<=[.!?])\s+",
-            text,
-        )
+        # Look at the sentence containing the supplier name.
+        sentences = re.split(r"(?<=[.!?])\s+", text)
 
         for sentence in sentences:
-
             sentence_lower = sentence.lower()
 
-            # Supplier must appear in THIS sentence.
             if supplier_lower not in sentence_lower:
                 continue
 
-            # And the same sentence must explicitly contain
-            # the consecutive-quarter condition.
-            consecutive = (
-                "second consecutive quarter"
-                in sentence_lower
-                or
-                "two consecutive quarters"
-                in sentence_lower
+            has_consecutive = (
+                "second consecutive quarter" in sentence_lower
+                or "two consecutive quarters" in sentence_lower
+                or "consecutive quarters" in sentence_lower
             )
 
-            below_85 = (
-                "below 85%"
-                in sentence_lower
+            has_below_85 = (
+                "below 85%" in sentence_lower
+                or "below 85 percent" in sentence_lower
             )
 
-            if consecutive and below_85:
-
+            if has_consecutive and has_below_85:
                 return {
                     "triggered": True,
                     "status": "CONFIRMED",
@@ -394,13 +513,6 @@ def check_clause_62(
                         "with this supplier."
                     ),
                 }
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # If we have not found supplier-specific evidence,
-    # we DO NOT guess.
-    # --------------------------------------------------------
 
     return {
         "triggered": False,
@@ -552,12 +664,16 @@ def is_policy_question(question):
         "policy",
         "trigger",
         "penalty",
+        "consequence",
+        "consequences",
+        "policy consequence",
+        "policy consequences",
+        "what must the buyer do",
         "buyer do",
-        "what must",
         "required action",
         "debit note",
         "improvement plan",
-        "inspection",
+        "incoming inspection",
         "delivery review",
     ]
 
@@ -778,12 +894,23 @@ Answer ONLY using the supplied document context.
 
 Rules:
 
-1. Do not invent facts.
-2. Do not use outside knowledge.
+1. Never invent facts.
+2. Never use outside knowledge.
 3. Do not mix facts between suppliers.
-4. If the answer is unavailable, say:
-   "The information is not available in the provided documents."
-5. Mention document names and page numbers where possible.
+4. Do not confuse table columns.
+5. Do not infer missing information.
+6. If the question asks for multiple items, return ALL
+   items explicitly supported by the documents.
+7. If the question refers to a named section, preserve
+   that section's complete list.
+8. Do not stop after the first few items.
+9. Do not add information from a different section unless
+   the question requires it.
+10. If the requested information is not available, respond exactly:
+
+"The information is not available in the provided documents."
+
+11. Keep answers concise but complete.
 """
 
     user_prompt = f"""
@@ -814,8 +941,11 @@ Answer using only the document context.
 
 def ask_question(question):
 
+    policy_question = is_policy_question(question)
+
     retrieved = retrieve_context(
-        question
+        question,
+        expand_pages=not policy_question,
     )
 
     evaluation = evaluate_policy(
@@ -838,8 +968,13 @@ def ask_question(question):
 
     else:
 
+        general_retrieved = select_general_context(
+            question,
+            retrieved,
+        )
+
         context = build_context(
-            retrieved
+            general_retrieved
         )
 
         answer = generate_general_answer(
@@ -967,15 +1102,21 @@ def main():
         f"Supplier: {evaluation['supplier']}"
     )
 
-    print(
-        f"On-time delivery: "
-        f"{evaluation['on_time']}%"
-    )
+    if evaluation["on_time"] is not None:
+        print(
+            f"On-time delivery: "
+            f"{evaluation['on_time']}%"
+        )
+    else:
+        print("On-time delivery: Not established from retrieved evidence")
 
-    print(
-        f"Defect rate: "
-        f"{int(evaluation['defect_ppm']):,} PPM"
-    )
+    if evaluation["defect_ppm"] is not None:
+        print(
+            f"Defect rate: "
+            f"{int(evaluation['defect_ppm']):,} PPM"
+        )
+    else:
+        print("Defect rate: Not established from retrieved evidence")
 
     print()
 
